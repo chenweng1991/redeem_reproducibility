@@ -1,0 +1,602 @@
+#' Define a function (From Scavenge, Yu et.al) convert nn list to mutual-knn adjacency matrix that can be further used for igraph 
+#'  Note, I also have an API called NN2M, which generate the knn adjacency matrix, 
+#'  That knn adjacency matrix * transposed adjacency matrix can create the mnn as well
+#'  However, I like the Fulong version better since it adjust for situations where a cell 
+#'  is not neighbors for any of its neighbors 
+#' @param nn  nn list, which has two components: nn$idx and nn$dist
+#' @export
+#' @return return an mnn adjacency matrix This is adjacency matrix can be input to igraph graph<-graph_from_adjacency_matrix(nn.matrix,diag = F,mode = "undirected")
+NN2MNN_fulong<-function(nn){
+knn <- nn$idx
+  tempx <- rep(0, nrow(knn))
+  for (i in seq_len(nrow(knn))){
+    xx <- apply(knn[knn[i, -1], ],
+                1,
+                function(x) {any(x==i)}
+    )
+    tempx[i] <- sum(xx)
+  }
+
+  knn2 <- list()
+  length(knn2) <- nrow(knn)
+  for (i in seq_len(nrow(knn))){
+    xx <- apply(knn[knn[i, -1], ],
+                1,
+                function(x) {any(x==i)}
+    )
+    if(sum(xx)>0){
+      temp_knn <- knn[i, c(TRUE, xx)]
+      temp_el <- cbind(temp_knn[1], c(temp_knn[-1]))
+    } else {
+      temp_el <- knn[i, seq_len(2)]
+    }
+    knn2[[i]] <- temp_el
+  }
+  el <- do.call(rbind.data.frame, knn2) |> as.matrix()
+  adj <- igraph::get.adjacency(igraph::graph.edgelist(el))
+mutualknn <- 1*((adj + t(adj)) > 0)
+colnames(mutualknn) <- rownames(mutualknn) <- row.names(nn$idx)
+return(mutualknn)
+}
+
+
+#' Define a function to compute mito mutations that are specific to Crispr-defined clusters
+#' 
+#' @param whm.cmd a dataframe with row names as cell, first and second columns are the coordinates of CMD/or PCA/or UMAP, etc
+#' The Last column is the "cluster"
+#' @param Cts.Mtx.bi The matrix of Cell VS mutation (bininized)
+#' @param exp A vector, the expectation ratio of each cluster (the length should be the same as cluster numbers), 
+#' the order should be the same as the order of cluster unique(whm.cmd$cluster[order(whm.cmd$cluster)])
+#' 
+#' @return Specific_Mito which is a dataframe of the all variants, each variant is a row. 
+
+Compute_specific_mito<-function(whm.cmd,Cts.Mtx.bi,exp){
+    whm.cmd<-whm.cmd[,"cluster",drop=F]
+    Cluster.number<-length(unique(whm.cmd[,"cluster"]))
+    Crspr_cluster_Mito<-Tomerge_v2(whm.cmd,as.data.frame(Cts.Mtx.bi)) %>% 
+.[complete.cases(.),] %>% group_by(cluster) %>% summarise_all(sum) %>% tibble::column_to_rownames("cluster") 
+    Crspr_cluster_Mito_count_8<-Crspr_cluster_Mito[,colSums(Crspr_cluster_Mito)>=8]
+    Vs<-colnames(Crspr_cluster_Mito_count_8)
+    # exp=prop.table(rowSums(Crspr_cluster_Mito_count_8))
+    Specific_Mito<-c()
+    for(Cl in 1:nrow(Crspr_cluster_Mito_count_8)){
+        Cl.name<-row.names(Crspr_cluster_Mito_count_8)[Cl]
+        ps<-c()
+        FCs<-c()
+        Xs<-c()
+        Totals<-c()
+        for(i in 1:ncol(Crspr_cluster_Mito_count_8)){
+        X<-Crspr_cluster_Mito_count_8[Cl,i]
+        Total=sum(Crspr_cluster_Mito_count_8[,i])
+        md<-binom.test(X,Total,p = exp[Cl],alternative="greater")
+        p<-md$p.value
+        FC<-log2((X/Total)/exp[Cl])
+        ps<-c(ps,p)
+        FCs<-c(FCs,FC)
+        Xs<-c(Xs,X)
+        Totals<-c(Totals,Total)
+        }    
+        res<-data.frame(Variants=colnames(Crspr_cluster_Mito_count_8),ps=ps,FCs=FCs,Xs=Xs,Totals=Totals,qs=qvalue(ps)$qvalues,Cluster=Cl.name)
+        Specific_Mito<-rbind(Specific_Mito,res)   
+    }   
+    return(Specific_Mito)
+}
+
+
+
+
+#' Define a function to compute mito mutations that are specific to Crispr-defined neighborhood
+#' For a given variants, it will test whether the cells that carry the variants are significantly closer to each other than random
+#' 
+#' @param whm This is the Crispr-based weighted hamming distance matrix (either dist or matrix is fine)
+#' @param Cts.Mtx.bi The matrix of Cell VS mutation (bininized)
+#' @param CellNcut The cutoff of the number of cells that carry the variant 
+#'
+#' @return Specific_Mito_ByNeighbor which is a dataframe of the all variants, each variant is a row. 
+
+Compute_specific_mito.neighbor<-function(Whm,Cts.Mtx.bi,CellNcut=8,reshuffleN=100){
+Crisp.rank<-apply(Whm,1,rank) %>% t
+Cts.Mtx.bi.filtered<-Cts.Mtx.bi[,colSums(Cts.Mtx.bi)>=CellNcut]
+pvalues<-c()
+Closeness.all<-c()
+for (i in 1:ncol(Cts.Mtx.bi.filtered)){
+    Cells.carry<-row.names(Cts.Mtx.bi.filtered)[Cts.Mtx.bi.filtered[,i]==1] 
+    Cells.carry<-Cells.carry[Cells.carry %in% row.names(Crisp.rank)]
+    if(length(Cells.carry)>25){
+        Cells.carry<-sample(Cells.carry,25)
+    }
+    Cells.carry.ranks<-Getrank(Cells.carry,Crisp.rank)
+    N=length(Cells.carry)
+    carry.random.ranks<-c()
+    for(shuffleN in 1:reshuffleN){
+        carry.random<-sample(row.names(Crisp.rank),N)
+        carry.random.ranks<-c(carry.random.ranks,Getrank(carry.random,Crisp.rank))
+    }
+    pvalue<-length(which(Cells.carry.ranks>=carry.random.ranks))/reshuffleN
+    Closeness<-(mean(carry.random.ranks)-Cells.carry.ranks)/mean(carry.random.ranks)    
+    pvalues<-c(pvalues,pvalue)
+    Closeness.all<-c(Closeness.all,Closeness)
+}
+Specific_Mito_ByNeighbor<-data.frame(Variants=colnames(Cts.Mtx.bi.filtered),pvalues=pvalues,Closeness.all=Closeness.all)
+return(Specific_Mito_ByNeighbor)
+}    
+
+Getrank<-function(Cells.carry,Crisp.rank){
+ranks<-c()
+for (Cell1 in Cells.carry){
+    Others<-setdiff(Cells.carry,Cell1)
+    for(Cell2 in Others){
+        ranks<-c(ranks,Crisp.rank[Cell1,Cell2])
+    }
+}
+return(median(ranks))
+}
+
+#' Define a function to plot the highlighted variants on the cmd/pca/umap, etc
+#' 
+#' @param whm.cmd a dataframe with row names as cell, first and second columns are the coordinates of CMD/or PCA/or UMAP, etc
+#' The Last column is the "cluster"
+#' @param Cts.Mtx.bi The matrix of Cell VS mutation (bininized)
+#' @param Select_V A vector of the variants to be shown
+#' 
+#' @return return a list of plots
+
+DrawMito_onCrispr<-function(whm.cmd,Cts.Mtx.bi,Select_V){
+datatoplot<-Tomerge_v2(whm.cmd,as.data.frame(Cts.Mtx.bi)) %>% .[complete.cases(.),] %>% .[,c("V1","V2",Select_V)]
+ps<-list()
+for(V in colnames(datatoplot)[3:ncol(datatoplot)]){
+    datatoplot[,V]<-as.character(datatoplot[,V])
+    p<-ggplot(datatoplot)+aes_string("V1","V2",color=V)+geom_point()+theme_bw()+
+    scale_color_manual(values=c("grey","red"))+labs(x="Dim1",y="Dim2")
+    ps<-c(ps,list(p))
+}
+return(ps)
+}   
+
+
+#' Define a function to plot the highlighted variants on the cmd/pca/umap, etc, This version have red dots on top
+#' Other than the layer of red dots, there is not difference from DrawMito_onCrispr
+#' @param whm.cmd a dataframe with row names as cell, first and second columns are the coordinates of CMD/or PCA/or UMAP, etc
+#' The Last column is the "cluster"
+#' @param Cts.Mtx.bi The matrix of Cell VS mutation (bininized)
+#' @param Select_V A vector of the variants to be shown
+#' 
+#' @return return a list of plots
+DrawMito_onCrispr2<-function(whm.cmd,Cts.Mtx.bi,Select_V){
+datatoplot<-Tomerge_v2(whm.cmd,as.data.frame(Cts.Mtx.bi)) %>% .[complete.cases(.),] %>% .[,c("V1","V2",Select_V)]
+ps<-list()
+for(V in colnames(datatoplot)[3:ncol(datatoplot)]){
+    datatoplot[,V]<-as.character(datatoplot[,V])
+    p<-ggplot(datatoplot)+aes_string("V1","V2")+geom_point(color="grey")+theme_bw()+geom_point(data=datatoplot[datatoplot[,V]=="1",],color="red")+labs(x="Dim1",y="Dim2")+ggtitle(V)+theme_classic()+theme(axis.text=element_blank(),axis.ticks = element_blank(),axis.title=element_blank())
+    ps<-c(ps,list(p))
+}
+names(ps)<-colnames(datatoplot)[3:ncol(datatoplot)]
+return(ps)
+}   
+
+
+
+
+#' Define a function to perform agreement of closeness analysis
+#'
+#' @param whm  This is the Crispr-based weighted hamming distance matrix (either dist or matrix is fine)
+#' @param Jac This is the Mito-based jaccard distance matrix (either dist or matrix is fine)
+#' The Last column is the "cluster"
+#' @param Cts.Mtx.bi The matrix of Cell VS mito mutation (bininized)
+#' 
+#' @return return Mito2Crisp.df which is a dataframe like this  
+#' Cell  pvalues EffectSizes VN
+#' AAACCGCCAGCCAATA_1  0.065 0.14605414  22
+RunMito2Crisp<-function(Whm,Jac,Cts.Mtx.bi,k,reshuffleN=1000){
+    Jac.d<-as.matrix(Jac)
+    Whm.d<-as.matrix(Whm)
+    IntersectCell<-intersect(row.names(Jac.d),row.names(Whm.d))
+    Jac.d<-Jac.d[IntersectCell,IntersectCell]
+    Whm.d<-Whm.d[IntersectCell,IntersectCell]
+    Jac.nn<-MakeNN(Jac.d,k.param = k)
+    Crisp_Jac.rank<-apply(Whm.d,1,rank) %>% t
+    n<-nrow(Crisp_Jac.rank)
+    pvalues<-c()
+    EffectSizes<-c()
+    for(i in 1:nrow(Crisp_Jac.rank)){
+        Reshuffle<-c()
+            for(j in 1:reshuffleN){
+            Reshuffle<-c(Reshuffle,mean(sample(Crisp_Jac.rank[i,],(k-1))))
+            }
+        Rank<-mean(Crisp_Jac.rank[i,Jac.nn$idx[i,2:k]])
+        p<-length(which(Rank>Reshuffle))/reshuffleN
+        Rankpct<-(mean(Reshuffle)-Rank)/n
+        pvalues<-c(pvalues,p)
+        EffectSizes<-c(EffectSizes,Rankpct)
+    }
+    Mito2Crisp.df<-data.frame(Cell=row.names(Crisp_Jac.rank),pvalues=pvalues,EffectSizes=EffectSizes)
+    Mito2Crisp.df$pvalues[Mito2Crisp.df$pvalues==0]<-1/reshuffleN
+    row.names(Mito2Crisp.df)<-Mito2Crisp.df$Cell
+    Mito2Crisp.df<-Tomerge_v2(Mito2Crisp.df,data.frame(VN=rowSums(Cts.Mtx.bi)))
+    return(Mito2Crisp.df)
+}
+
+#' Define a function to draw agreement of closeness results
+#'
+#' @param phylo tree object
+#' @param Mito2Crispr.df The result from RunMito2Crisp
+#' 
+#' @return return the ggplot object
+Draw_Mito2Crispr<-function(phylo,Mito2Crispr.df){
+library(viridis)
+library(dplyr)
+p<-ggtree(as.treedata(phylo),branch.length="none")+geom_fruit( 
+         data=Mito2Crispr.df, 
+         geom=geom_bar, 
+         mapping=aes(y=Cell,x=-EffectSizes,fill=-log10(pvalues)), 
+         pwidth=0.5, 
+         width=1, 
+         offset=0.4, 
+         orientation="y", 
+         stat="identity",axis.params=list(
+                         axis       = "x",
+                         text.size  = 2,
+                         hjust      = 1,
+                         vjust      = 0.5,
+                         nbreak     = 3)
+                      
+     )+scale_fill_gradient(high="red",low="steelblue")+
+ggnewscale::new_scale_fill()+
+geom_fruit( 
+         data=Mito2Crispr.df, 
+         geom=geom_bar, 
+         mapping=aes(y=Cell,x=1,fill=VN), 
+         pwidth=0.2, 
+         width=1, 
+         offset=0, 
+         orientation="y", 
+         stat="identity",axis.params=list(
+                         axis       = "x",
+                         text.size  = 5,
+                         hjust      = 1,
+                         vjust      = 0.5,
+                         nbreak     = 3))+scale_fill_viridis()
+    
+return(p)
+}
+
+
+
+Draw_Mito2Crispr_clone<-function(phylo,Mito2Crispr.df,meta,CloneCat="Clone_merge"){
+library(viridis)
+library(dplyr)
+n=length(unique(meta[,CloneCat]))
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector<-sample(col_vector,n,replace=T)
+p<-ggtree(as.treedata(phylo),branch.length="none")+geom_fruit( 
+         data=meta, 
+         mapping=aes_string(y="Cell",x=2,fill=CloneCat), geom=geom_tile,
+         pwidth=0.001, 
+         width=3, 
+         offset=0.05
+)+scale_fill_manual(values=col_vector)+
+ggnewscale::new_scale_fill()+
+geom_fruit( 
+         data=Mito2Crispr.df, 
+         geom=geom_bar, 
+         mapping=aes(y=Cell,x=-EffectSizes,fill=-log10(pvalues)), 
+         pwidth=0.5, 
+         width=1, 
+         offset=0.4, 
+         orientation="y", 
+         stat="identity",axis.params=list(
+                         axis       = "x",
+                         text.size  = 2,
+                         hjust      = 1,
+                         vjust      = 0.5,
+                         nbreak     = 3)
+                      
+     )+scale_fill_gradient(high="red",low="steelblue")
+
+return(p)
+}
+
+
+
+
+####################Functions for MKP2
+## Modify the Vfilter_v3 into Vfilter_X_Max_Count
+Vfilter_X_Max_Count<-function(InputSummary,depth,Min_Cells=2,QualifyCellCut=10,WhitelistV=MKP_WhiteList){
+    CV<-function(x){
+    var(x)/mean(x)
+    }
+    
+print(Min_Cells)
+Names<-names(InputSummary)
+feature.list<-list()
+for(i in Names){
+VariantFeature0<- InputSummary[[i]] %>% group_by(Variants) %>% dplyr::summarise(CellN=n(),PositiveMean=mean(hetero),maxcts=max(Freq),CV=CV(hetero),TotalVcount=sum(Freq))
+VariantFeature0$pos<-strsplit(VariantFeature0$Variants,"_") %>% sapply(.,function(x){x[1]}) %>% as.numeric
+VariantFeature0<-merge(VariantFeature0,depth[[i]][[1]],by.x="pos",by.y="V2")   ## This generate different meanCov for each threahold
+VariantFeature0$TotalCov<-length(unique(InputSummary[[i]]$Cell))*VariantFeature0$meanCov
+VariantFeature0$VAF<-VariantFeature0$TotalVcount/VariantFeature0$TotalCov
+qualifiedCell<-subset(depth[["Total"]][[2]],meanCov>=QualifyCellCut)[,1,drop=T]  ## Filter Qualified cell based on total depth
+InputSummary.qualified<-subset(InputSummary[[i]],Cell %in% qualifiedCell)
+VariantFeature<- InputSummary.qualified %>% group_by(Variants) %>% dplyr::summarise(CellN=n(),PositiveMean=mean(hetero),maxcts=max(Freq),CV=CV(hetero),TotalVcount=sum(Freq))
+print(paste(i,":\n",nrow(VariantFeature0),"variants to start"))
+print(paste(nrow(VariantFeature),"variants after remove low quality cells"))
+VariantFeature$CellNPCT<-VariantFeature$CellN/length(unique(InputSummary.qualified$Cell))
+VariantFeature<-merge(VariantFeature[,c("Variants","CellN","PositiveMean","maxcts","CellNPCT")],VariantFeature0[,c("Variants","TotalVcount","TotalCov","VAF","CV")],by="Variants")
+#HomoVariants<-subset(VariantFeature,VAF>0.9 & CV<0.01)$Variants
+HomoVariants<-subset(VariantFeature,CellNPCT>0.75 & PositiveMean>0.75 & CV<0.01)$Variants
+VariantFeature$HomoTag<-ifelse(VariantFeature$Variants %in% HomoVariants,"Homo","Hetero") 
+print(Min_Cells)    
+out<-subset(VariantFeature,CellN>=Min_Cells)    
+out<-out[paste("Variants",gsub("_","",out$Variants),sep="") %in% WhitelistV,]  #MKP_WhiteList
+print(paste("After filtering,",nrow(out), "Variants left"))
+print("\n\n")
+feature.list<-c(feature.list,list(out))
+}
+    names(feature.list)<-Names
+    return(feature.list)
+}
+
+
+Make_MitoTracing_VS<-function(RawGenotypes, depth, limitV=NA,Homo="",WhitelistV=MKP_WhiteList,Ncell=2){
+GiveName <- c("UMI", "Cell", "Pos", "Variants", "Call", "Ref", "FamSize", "GT_Cts", "CSS", "DB_Cts", "SG_Cts", "Plus", "Minus", "Depth")
+colnames(RawGenotypes)<-GiveName
+RawGenotypes<-RawGenotypes %>% filter((DB_Cts>0 & FamSize>=1 & CSS>0.75) | (DB_Cts==0 & FamSize>=2 & CSS>0.75))
+
+## Generate genotype table
+VariantsGTSummary<-list(Sensitive=GTSummary(RawGenotypes) %>% mutate(hetero=Freq/depth))
+
+## generate variant feature list
+Variants.feature.lst<-Vfilter_X_Max_Count(InputSummary=VariantsGTSummary,depth=depth,Min_Cells=2,QualifyCellCut=10,WhitelistV=WhitelistV)
+Variants.feature.lst$Sensitive<-Variants.feature.lst$Sensitive %>% subset(.,!Variants %in% Homo)
+## populate the scMitoTracing object
+mitoTracing.Sensitive<-Create_mitoTracing(GTsummary_list=list(VariantsGTSummary),
+                depth_list=list(depth),
+                feature.list_list=list(Variants.feature.lst),
+                meta_list=list(depth$Total[[2]] %>% rename(.,ATACName=V1)),
+                thr="Sensitive",
+                labels=c("Test"),qualifiedCellCut = 10, OnlyHetero = T, VAFcut = 1, Cellcut = Ncell, maxctscut = 1)
+
+# ## Run basic pipeline
+# mitoTracing.Sensitive<-Make_matrix(mitoTracing.Sensitive)
+## Make the matrix
+require(dplyr)
+require(Matrix.utils)
+Cts.Mtx<-dMcast(mitoTracing.Sensitive@GTsummary.filtered,Cell~Variants,value.var = "Freq")
+colnames(Cts.Mtx)<-strsplit(as.character(colnames(Cts.Mtx)),"_") %>% sapply(.,function(x){paste(x[1],x[2],x[3],sep="")})
+Cts.Mtx.bi<-Cts.Mtx
+Cts.Mtx.bi[Cts.Mtx.bi>=1]<-1
+if (length(limitV)>1){
+    Cts.Mtx<-Cts.Mtx[,intersect(colnames(Cts.Mtx),limitV)]
+    Cts.Mtx.bi<-Cts.Mtx.bi[,intersect(colnames(Cts.Mtx),limitV)]
+}
+mitoTracing.Sensitive@Cts.Mtx.bi<-Cts.Mtx.bi
+mitoTracing.Sensitive@Cts.Mtx<-Cts.Mtx    
+data(CellPCT)
+V.weight<-data.frame(weight=1-CellPCT$muRate)
+V.weight$Variants<-paste("Variants",gsub("_","",CellPCT$Variant),sep="")
+# mitoTracing.Sensitive<-SeuratLSIClustering(mitoTracing.Sensitive,lsidim=2:50,rmvariants=c("Variants310TC","Variants3109TC","Variants5764CT"))
+weight<-data.frame(Variants=colnames(mitoTracing.Sensitive@Cts.Mtx.bi)) %>% merge(.,V.weight,by="Variants",all.x = T,sort = F) %>% .$weight
+weight[is.na(weight)]<-1
+d.w_jaccard<-quick_w_jaccard(mitoTracing.Sensitive@Cts.Mtx.bi,w=weight)
+phylo<-nj(d.w_jaccard)
+return(list(Cts.Mtx.bi=Cts.Mtx.bi,d.w_jaccard=d.w_jaccard,phylo=phylo,mitoTracing.Sensitive=mitoTracing.Sensitive))    
+}
+
+
+
+
+
+
+
+
+Add_tree_cut_simple<-function(phy,MinCell=30,CellMeta,prob.cut=0.3,Dumpcut=100){
+require(phangorn) 
+AllAncestors<-Ancestors(phy,phy$edge[,2],type="all")
+SumV.df_CloneNode<-data.frame(Node=phy$edge[,2],Dummy="")  ## Make a node table Node|SumV  
+SumV.df_CloneNode.filtered<-SumV.df_CloneNode[Ancestors(phy,SumV.df_CloneNode$Node) %>% sapply(.,function(x){!any(x %in% SumV.df_CloneNode$Node)}),]  ## Leave only the relative most ancester
+SumV.df_CloneNode.filtered<-data.frame(SumV.df_CloneNode.filtered,CladeSize=sapply(Descendants(phy,SumV.df_CloneNode.filtered$Node,type="tips"),length)) %>% .[order(.$CladeSize),]
+FinalCloneNodes<-SumV.df_CloneNode.filtered[,c(1,3)] %>% .[order(.$CladeSize),] 
+Smallclones<-c()
+while(FinalCloneNodes$CladeSize[1]<MinCell){
+    SibNode<-Siblings(phy,FinalCloneNodes$Node[1])
+    if(length(Descendants(phy,SibNode)[[1]])<100){
+        Parent<-data.frame(Node=Ancestors(phy,FinalCloneNodes$Node[1],type="parent"),CladeSize=sapply(Descendants(phy,Ancestors(phy,FinalCloneNodes$Node[1],type="parent")),length))
+        FinalCloneNodes<-rbind(FinalCloneNodes[-1,],Parent)
+        FinalCloneNodes<-FinalCloneNodes[order(FinalCloneNodes$CladeSize),]
+    }else{
+        Smallclones<-rbind(Smallclones,FinalCloneNodes[1,])
+        FinalCloneNodes<-FinalCloneNodes[-1,]            
+    }
+}
+FinalCloneNodes<-rbind(FinalCloneNodes,Smallclones)
+FinalCloneNodes<-FinalCloneNodes[!duplicated(FinalCloneNodes),]
+FinalCloneNodes<-FinalCloneNodes[Ancestors(phy,FinalCloneNodes$Node) %>% sapply(.,function(x){!any(x %in% FinalCloneNodes$Node)}),]
+FinalCloneNodes<-FinalCloneNodes[order(FinalCloneNodes$CladeSize,decreasing=T),]
+Bigclones<-c()
+while(FinalCloneNodes$CladeSize[1]>100){
+node=FinalCloneNodes$Node[1]
+X<-as.list(rep(0,nrow(FinalCloneNodes)))
+names(X)<-FinalCloneNodes$Node
+CurrentSize<-sapply(Descendants(phy,node),length)
+if(length(Descendants(phy,node,type="children"))>2){ 
+    x<-Descendants(phy,node,type="children")
+    x.size<-sapply(Descendants(phy,x),length)
+    a<-Descendants(phy,node,type="children")[order(x.size,decreasing=T)[1]]
+    b<-Descendants(phy,node,type="children")[order(x.size,decreasing=T)[2]]
+}else{
+    a<-Descendants(phy,node,type="children")[1]
+    b<-Descendants(phy,node,type="children")[2]
+}
+a.size<-sapply(Descendants(phy,a),length)
+b.size<-sapply(Descendants(phy,b),length)
+if(min(a.size,b.size)>MinCell){
+    subreturn_small<-data.frame(Node=c(a,b)[which.min(c(a.size,b.size))],CladeSize=sapply(Descendants(phy,c(a,b)[which.min(c(a.size,b.size))]),length))
+    subreturn_big<-data.frame(Node=c(a,b)[which.max(c(a.size,b.size))],CladeSize=sapply(Descendants(phy,c(a,b)[which.max(c(a.size,b.size))]),length))
+    FinalCloneNodes<-FinalCloneNodes[-1,]
+    FinalCloneNodes<-rbind(FinalCloneNodes,subreturn_small)
+    FinalCloneNodes<-rbind(FinalCloneNodes,subreturn_big)
+}else{
+    node_sub=c(a,b)[which.max(c(a.size,b.size))]
+    a_sub<-Descendants(phy,node_sub,type="children")[1]
+    b_sub<-Descendants(phy,node_sub,type="children")[2]
+    a_sub.size<-sapply(Descendants(phy,a_sub),length)
+    b_sub.size<-sapply(Descendants(phy,b_sub),length)
+    if(min(a_sub.size,b_sub.size)>MinCell){
+        subreturn_small.2<-data.frame(Node=c(a_sub,b_sub)[which.min(c(a_sub.size,b_sub.size))],CladeSize=sapply(Descendants(phy,c(a_sub,b_sub)[which.min(c(a_sub.size,b_sub.size))]),length))
+        subreturn_big.2<-data.frame(Node=c(a_sub,b_sub)[which.max(c(a_sub.size,b_sub.size))],CladeSize=sapply(Descendants(phy,c(a_sub,b_sub)[which.max(c(a_sub.size,b_sub.size))]),length))
+        FinalCloneNodes<-FinalCloneNodes[-1,]
+        FinalCloneNodes<-rbind(FinalCloneNodes,subreturn_small.2)
+        FinalCloneNodes<-rbind(FinalCloneNodes,subreturn_big.2)
+        }
+    else{
+        Dump<-min(a_sub.size,b_sub.size)
+        node_sub=c(a_sub,b_sub)[which.max(c(a_sub.size,b_sub.size))]
+        while(Dump<Dumpcut){
+          a_sub<-Descendants(phy,node_sub,type="children")[1]
+          b_sub<-Descendants(phy,node_sub,type="children")[2]
+          a_sub.size<-sapply(Descendants(phy,a_sub),length)
+          b_sub.size<-sapply(Descendants(phy,b_sub),length)
+          if(min(a_sub.size,b_sub.size)<MinCell & min(a_sub.size,b_sub.size)>0){
+            Dump<-Dump+min(a_sub.size,b_sub.size)
+            node_sub=c(a_sub,b_sub)[which.max(c(a_sub.size,b_sub.size))]
+          }else{
+            subreturn_small.2<-data.frame(Node=c(a_sub,b_sub)[which.min(c(a_sub.size,b_sub.size))],CladeSize=sapply(Descendants(phy,c(a_sub,b_sub)[which.min(c(a_sub.size,b_sub.size))]),length))
+            subreturn_big.2<-data.frame(Node=c(a_sub,b_sub)[which.max(c(a_sub.size,b_sub.size))],CladeSize=sapply(Descendants(phy,c(a_sub,b_sub)[which.max(c(a_sub.size,b_sub.size))]),length))
+            FinalCloneNodes<-FinalCloneNodes[-1,]
+            FinalCloneNodes<-rbind(FinalCloneNodes,subreturn_small.2)
+            FinalCloneNodes<-rbind(FinalCloneNodes,subreturn_big.2)
+            break
+          }
+        }
+        if(Dump>=Dumpcut){
+        FinalCloneNodes<-FinalCloneNodes[-1,]
+        Bigclones<-rbind(Bigclones,data.frame(Node=node,CladeSize=sapply(Descendants(phy,node),length)))
+        }
+        }
+ }
+FinalCloneNodes<-FinalCloneNodes[order(FinalCloneNodes$CladeSize,decreasing=T),] 
+}
+FinalCloneNodes<-rbind(FinalCloneNodes,Bigclones)
+FinalCloneNodes<-FinalCloneNodes[order(FinalCloneNodes$CladeSize,decreasing=T),] 
+FinalCloneNodes<-FinalCloneNodes[complete.cases(FinalCloneNodes),]
+FinalCloneNodes$Clone<-1:nrow(FinalCloneNodes)
+SumV.df_CloneNode.filtered<-SumV.df_CloneNode.filtered[order(SumV.df_CloneNode.filtered$CladeSize,decreasing=T),]
+SumV.df_CloneNode.filtered$Clone<-1:nrow(SumV.df_CloneNode.filtered)
+FinalClone.report<-FinalCloneNodes %>% apply(.,1,function(x){data.frame(Cell=phy$tip.label[unlist(Descendants(phy,as.numeric(x[1])))],Clade_merge=x[1],Clone_merge=x[3],row.names = NULL)}) %>% do.call(rbind,.)
+OriginClone.report<-SumV.df_CloneNode.filtered  %>% apply(.,1,function(x){data.frame(Cell=phy$tip.label[unlist(Descendants(phy,as.numeric(x[1])))],Clade=x[1],Clone=x[4],row.names = NULL)}) %>% do.call(rbind,.)
+CellMeta<-CellMeta[,!colnames(CellMeta) %in% c("Clade_merge","Clone_merge")]
+CellMeta<-merge(CellMeta,FinalClone.report,all.x=T)
+return(CellMeta)  # Note, may get NA, if only a few cells are NA, it is expected those are not assigned confidently
+}
+
+
+Make_MitoTracing_heteroplasmy<-function(RawGenotypes, depth, limitV=NA,Homo="",WhitelistV=MKP_WhiteList){
+GiveName <- c("UMI", "Cell", "Pos", "Variants", "Call", "Ref", "FamSize", "GT_Cts", "CSS", "DB_Cts", "SG_Cts", "Plus", "Minus", "Depth")
+colnames(RawGenotypes)<-GiveName
+RawGenotypes<-RawGenotypes %>% filter((DB_Cts>0 & FamSize>=1 & CSS>0.75) | (DB_Cts==0 & FamSize>=2 & CSS>0.75))
+
+## Generate genotype table
+VariantsGTSummary<-list(Sensitive=GTSummary(RawGenotypes) %>% mutate(hetero=Freq/depth))
+
+## generate variant feature list
+Variants.feature.lst<-Vfilter_X_Max_Count(InputSummary=VariantsGTSummary,depth=depth,Min_Cells=2,QualifyCellCut=10,WhitelistV=WhitelistV)
+Variants.feature.lst$Sensitive<-Variants.feature.lst$Sensitive %>% subset(.,!Variants %in% Homo)
+## populate the scMitoTracing object
+mitoTracing.Sensitive<-Create_mitoTracing(GTsummary_list=list(VariantsGTSummary),
+                depth_list=list(depth),
+                feature.list_list=list(Variants.feature.lst),
+                meta_list=list(depth$Total[[2]] %>% rename(.,ATACName=V1)),
+                thr="Sensitive",
+                labels=c("Test"),qualifiedCellCut = 10, OnlyHetero = T, VAFcut = 1, Cellcut = 2, maxctscut = 1)
+
+# ## Run basic pipeline
+# mitoTracing.Sensitive<-Make_matrix(mitoTracing.Sensitive)
+## Make the matrix
+require(dplyr)
+require(Matrix.utils)
+Cts.Mtx<-dMcast(mitoTracing.Sensitive@GTsummary.filtered,Cell~Variants,value.var = "Freq")
+heteroplasmy.Mtx<-dMcast(mitoTracing.Sensitive@GTsummary.filtered,Cell~Variants,value.var = "hetero")
+colnames(Cts.Mtx)<-strsplit(as.character(colnames(Cts.Mtx)),"_") %>% sapply(.,function(x){paste(x[1],x[2],x[3],sep="")})
+Cts.Mtx.bi<-Cts.Mtx
+Cts.Mtx.bi[Cts.Mtx.bi>=1]<-1
+mitoTracing.Sensitive@Cts.Mtx.bi<-Cts.Mtx.bi
+mitoTracing.Sensitive@Cts.Mtx<-Cts.Mtx    
+data(CellPCT)
+V.weight<-data.frame(weight=1-CellPCT$muRate)
+V.weight$Variants<-paste("Variants",gsub("_","",CellPCT$Variant),sep="")
+# mitoTracing.Sensitive<-SeuratLSIClustering(mitoTracing.Sensitive,lsidim=2:50,rmvariants=c("Variants310TC","Variants3109TC","Variants5764CT"))
+weight<-data.frame(Variants=colnames(mitoTracing.Sensitive@Cts.Mtx.bi)) %>% merge(.,V.weight,by="Variants",all.x = T,sort = F) %>% .$weight
+weight[is.na(weight)]<-1
+d.w_jaccard<-quick_w_jaccard(mitoTracing.Sensitive@Cts.Mtx.bi,w=weight)
+d.w_cosine<-quick_w_cosine(heteroplasmy.Mtx,w=weight)
+return(list(Cts.Mtx.bi=Cts.Mtx.bi,heteroplasmy.Mtx=heteroplasmy.Mtx,d.w_jaccard=d.w_jaccard,d.w_cosine=d.w_cosine,Variants.feature=Variants.feature.lst$Sensitive))    
+}
+
+
+## Modify the Vfilter_v3 into Vfilter_X_Max_Count
+Vfilter_X_Max_Count<-function(InputSummary,depth,Min_Cells=2,QualifyCellCut=10,WhitelistV=MKP_WhiteList){
+    CV<-function(x){
+    var(x)/mean(x)
+    }
+    
+print(Min_Cells)
+Names<-names(InputSummary)
+feature.list<-list()
+for(i in Names){
+VariantFeature0<- InputSummary[[i]] %>% group_by(Variants) %>% dplyr::summarise(CellN=n(),PositiveMean=mean(hetero),maxcts=max(Freq),CV=CV(hetero),TotalVcount=sum(Freq))
+VariantFeature0$pos<-strsplit(VariantFeature0$Variants,"_") %>% sapply(.,function(x){x[1]}) %>% as.numeric
+VariantFeature0<-merge(VariantFeature0,depth[[i]][[1]],by.x="pos",by.y="V2")   ## This generate different meanCov for each threahold
+VariantFeature0$TotalCov<-length(unique(InputSummary[[i]]$Cell))*VariantFeature0$meanCov
+VariantFeature0$VAF<-VariantFeature0$TotalVcount/VariantFeature0$TotalCov
+qualifiedCell<-subset(depth[["Total"]][[2]],meanCov>=QualifyCellCut)[,1,drop=T]  ## Filter Qualified cell based on total depth
+InputSummary.qualified<-subset(InputSummary[[i]],Cell %in% qualifiedCell)
+VariantFeature<- InputSummary.qualified %>% group_by(Variants) %>% dplyr::summarise(CellN=n(),PositiveMean=mean(hetero),maxcts=max(Freq),CV=CV(hetero),TotalVcount=sum(Freq))
+print(paste(i,":\n",nrow(VariantFeature0),"variants to start"))
+print(paste(nrow(VariantFeature),"variants after remove low quality cells"))
+VariantFeature$CellNPCT<-VariantFeature$CellN/length(unique(InputSummary.qualified$Cell))
+VariantFeature<-merge(VariantFeature[,c("Variants","CellN","PositiveMean","maxcts","CellNPCT")],VariantFeature0[,c("Variants","TotalVcount","TotalCov","VAF","CV")],by="Variants")
+#HomoVariants<-subset(VariantFeature,VAF>0.9 & CV<0.01)$Variants
+HomoVariants<-subset(VariantFeature,CellNPCT>0.75 & PositiveMean>0.75 & CV<0.01)$Variants
+VariantFeature$HomoTag<-ifelse(VariantFeature$Variants %in% HomoVariants,"Homo","Hetero") 
+print(Min_Cells)    
+out<-subset(VariantFeature,CellN>=Min_Cells)    
+out<-out[paste("Variants",gsub("_","",out$Variants),sep="") %in% WhitelistV,]  #MKP_WhiteList
+print(paste("After filtering,",nrow(out), "Variants left"))
+print("\n\n")
+feature.list<-c(feature.list,list(out))
+}
+    names(feature.list)<-Names
+    return(feature.list)
+}
+
+
+Get_Clonal_Variants<-function(object){
+meta<-object@CellMeta %>% .[complete.cases(.),c("Cell","Clone_merge"),drop=F]
+mtx<-object@Cts.Mtx.bi[meta$Cell,]
+Clonal_Variants<-list()
+for(clone in unique(meta$Clone_merge)){
+CellofClone<-subset(meta,Clone_merge==clone)$Cell
+Total<-nrow(meta) ## Total Cell number
+CloneSize<-length(CellofClone)
+ps<-c()
+odds<-c()
+    for (i in 1:ncol(mtx)){
+    VariantSize<-sum(mtx[,i])  # Number of cells with the variants
+    A=sum(mtx[CellofClone,i])   # Number of cell in the clone and with variants
+    B=CloneSize-A      # Number of cell in the clone and without variants
+    C=VariantSize-A  # Number of cell not in the clone but with the variant
+    D=Total-CloneSize-C  # Number of cell not in the clone and not with the variant
+    mod<-fisher.test(matrix(c(A,B,C,D),2,2),alternative="greater")
+    p<-mod$p.value
+    odd<-mod$estimate
+        ps<-c(ps,p)
+        odds<-c(odds,odd)
+    }
+stat<-data.frame(p=ps,odd=odds,FDR=qvalue(ps)$qvalues,variants=colnames(mtx)) 
+Clonal_Variants<-c(Clonal_Variants,list(stat))
+}
+names(Clonal_Variants)<-unique(meta$Clone_merge)
+return(Clonal_Variants)
+}    
+
