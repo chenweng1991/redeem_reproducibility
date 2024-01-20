@@ -600,3 +600,206 @@ names(Clonal_Variants)<-unique(meta$Clone_merge)
 return(Clonal_Variants)
 }    
 
+########### Below are functions for CRISPR ReDeeM analysis
+####################
+# Here define several in-house functions for this section
+
+## 1. Make a wrapped function for dimension reduction for CRISPR hamming distances
+Run_Crispr<-function(whm,N=7){
+    cmd.fit <- cmdscale(whm,eig=TRUE, k=2)
+    cmd.hc<-hclust(as.dist(whm))
+    cmd.hc.clusters<-cutree(cmd.hc,k = N) %>% data.frame(cluster=.) %>% mutate(cluster=as.character(cluster))
+    cmd.fit.result<-cmd.fit$point %>% as.data.frame() %>% Tomerge_v2(.,cmd.hc.clusters)
+    p<-ggplot(cmd.fit.result)+aes(V1,V2,color=cluster)+geom_point()+theme_pubr()+scale_color_brewer(palette="Set1")+labs(x="Dim1",y="Dim2")
+    return(list(cmd.fit.result=cmd.fit.result,p=p))
+}
+
+## 2. warpped function for CRISPR clonal clustering using hierarchical and louvain clustering 
+crispr_clustering<-function(whm.list, hcN=7,res=0.2){
+    whm.hc.list<-list()
+    ps<-list()
+    for(i in 1:6){
+        whm.hc<-Run_Crispr(whm.list[[i]],N=hcN)
+        whm.hc.list<-c(whm.hc.list,list(whm.hc[[1]]))
+        ps<-c(ps,list(whm.hc[[2]]))
+    }
+    whm.hc.lovein.list<-list()
+    for(i in 1:6){
+    nn<-MakeNN(whm.list[[i]])
+    mutualknn<-NN2MNN_fulong(nn)
+    nn.matrix.g<-graph_from_adjacency_matrix(mutualknn,diag = F, mode="undirected")
+    cluster_louvain(nn.matrix.g, weights = NULL, resolution = res) -> cluster
+    whm.hc.lovein<-data.frame(Cell=row.names(whm.list[[i]]),lovein=as.character(cluster$membership)) %>% tibble::column_to_rownames("Cell") %>% Tomerge_v2(whm.hc.list[[i]],.) 
+    whm.hc.lovein.list<-c(whm.hc.lovein.list,list(whm.hc.lovein))
+    }
+return(whm.hc.lovein.list)
+}    
+
+
+
+## For Adjusted Rand index analysis
+Process_mitoTracing_LSI<-function(mitoTracing, resolution=1){
+data(CellPCT)
+V.weight<-data.frame(weight=1-CellPCT$muRate)
+V.weight$Variants<-paste("Variants",gsub("_","",CellPCT$Variant),sep="")
+mitoTracing<-SeuratLSIClustering_small(mitoTracing,lsidim=1:20,res=resolution)
+mitoTracing<-AddDist_legacy(mitoTracing,weightDF=V.weight,LSIdist=T,dim=1:20)
+mitoTracing<-Make_tree_legacy(mitoTracing,d = "LSIdist",algorithm = "nj",onlyreturntree = F)
+return(mitoTracing)
+}
+
+make_mitoLSI<-function(master.list,res){
+mitotracing_LSI.list<-list()
+for (i in 1:length(master.list)){
+    mitotracing_LSI.list<-c(mitotracing_LSI.list,list(Process_mitoTracing_LSI(master.list[[i]]$mitoTracing.Sensitive, resolution=res)))
+}
+names(mitotracing_LSI.list)<-names(master.list)
+return(mitotracing_LSI.list)    
+}
+
+## Define SeuratLSIClustering_small for Seurat LSI clonal clustering
+SeuratLSIClustering_small<-function(object,binary=T,res=0.6,lsidim=2:20,rmvariants=c("Variants310TC","Variants3109TC","Variants5764CT")){
+          require(Signac)
+          if(binary){
+              Cts.Mtx.bi<-as.matrix(object@Cts.Mtx.bi)
+              Cts.Mtx.bi<-Cts.Mtx.bi[,!colnames(Cts.Mtx.bi) %in% rmvariants]
+              Cts.Mtx.bi<-Cts.Mtx.bi[rowSums(Cts.Mtx.bi)>0,]
+              sparse.mtx<-as(t(as.matrix(Cts.Mtx.bi)),"sparseMatrix")
+              Cell_Variant.seurat<-CreateSeuratObject(counts = sparse.mtx, assay = "redeemR")
+          }else{
+              Cts.Mtx<-as.matrix(object@Cts.Mtx)
+              Cts.Mtx<-Cts.Mtx[,!colnames(object@Cts.Mtx) %in% rmvariants]
+              Cts.Mtx<-Cts.Mtx[rowSums(Cts.Mtx)>0,]
+              sparse.mtx<-as(t(as.matrix(Cts.Mtx)),"sparseMatrix")
+              Cell_Variant.seurat<-CreateSeuratObject(counts = sparse.mtx, assay = "redeemR")
+          }
+          VariableFeatures(Cell_Variant.seurat) <- row.names(Cell_Variant.seurat) #names(which(Matrix::rowSums(Cell_Variant.seurat) > 100))
+          Cell_Variant.seurat <- RunTFIDF(Cell_Variant.seurat, n = 20)
+          Cell_Variant.seurat<- FindTopFeatures(Cell_Variant.seurat, min.cutoff = 2)
+          Cell_Variant.seurat <- RunSVD(Cell_Variant.seurat, n = 20)
+          Cell_Variant.seurat <- RunUMAP(Cell_Variant.seurat, reduction = "lsi", dims = lsidim)
+          Cell_Variant.seurat <- RunTSNE(Cell_Variant.seurat, reduction = "lsi", dims = lsidim,check_duplicates = FALSE)
+          Cell_Variant.seurat <- FindNeighbors(Cell_Variant.seurat,reduction ="lsi"  ,dims = lsidim)
+          Cell_Variant.seurat <- FindClusters(Cell_Variant.seurat, resolution = res)
+          object@Seurat<-Cell_Variant.seurat
+          return(object)
+}
+
+compute_rand<-function(whm.cmd.lovein_Jacclone_LSI.list,n=0){
+require(fossil)
+require(clues)
+randindex.hc_JacTree<-c()
+randindex.LV_JacTree<-c()
+randindex.hc_LSI<-c()
+randindex.LV_LSI<-c()
+adj.randindex.hc_JacTree<-c()
+adj.randindex.LV_JacTree<-c()
+adj.randindex.hc_LSI<-c()
+adj.randindex.LV_LSI<-c()
+for(i in 1:length(whm.cmd.lovein_Jacclone_LSI.list)){
+meta<-whm.cmd.lovein_Jacclone_LSI.list[[i]] %>% .[complete.cases(.),]
+randindex.hc_JacTree<-c(randindex.hc_JacTree,rand.index(as.numeric(as.character(meta$cluster)),as.numeric(as.character(meta$Clone_merge))))
+randindex.LV_JacTree<-c(randindex.LV_JacTree,rand.index(as.numeric(as.character(meta$lovein)),as.numeric(as.character(meta$Clone_merge))))
+randindex.hc_LSI<-c(randindex.hc_LSI,rand.index(as.numeric(as.character(meta$cluster)),as.numeric(as.character(meta$LSI_clones))))
+randindex.LV_LSI<-c(randindex.LV_LSI,rand.index(as.numeric(as.character(meta$lovein)),as.numeric(as.character(meta$LSI_clones))))
+adj.randindex.hc_JacTree<-c(adj.randindex.hc_JacTree,adj.rand.index(as.numeric(as.character(meta$cluster)),as.numeric(as.character(meta$Clone_merge))))
+adj.randindex.LV_JacTree<-c(adj.randindex.LV_JacTree,adj.rand.index(as.numeric(as.character(meta$lovein)),as.numeric(as.character(meta$Clone_merge))))
+adj.randindex.hc_LSI<-c(adj.randindex.hc_LSI,adj.rand.index(as.numeric(as.character(meta$cluster)),as.numeric(as.character(meta$LSI_clones))))
+adj.randindex.LV_LSI<-c(adj.randindex.LV_LSI,adj.rand.index(as.numeric(as.character(meta$lovein)),as.numeric(as.character(meta$LSI_clones))))
+
+}
+randindex<-list(randindex.hc_JacTree=randindex.hc_JacTree,randindex.LV_JacTree=randindex.LV_JacTree,randindex.hc_LSI=randindex.hc_LSI,randindex.LV_LSI=randindex.LV_LSI)
+adj.randindex<-list(adj.randindex.hc_JacTree=adj.randindex.hc_JacTree,adj.randindex.LV_JacTree=adj.randindex.LV_JacTree,adj.randindex.hc_LSI=adj.randindex.hc_LSI,adj.randindex.LV_LSI=adj.randindex.LV_LSI)
+
+return(list(randindex=randindex,adj.randindex=adj.randindex))
+}
+
+compute_rand_v2<-function(whm.cmd.lovein_Jacclone_LSI.list){
+randindex.hc_JacTree<-c()
+randindex.LV_JacTree<-c()
+randindex.hc_LSI<-c()
+randindex.LV_LSI<-c()
+adj.randindex.hc_JacTree<-c()
+adj.randindex.LV_JacTree<-c()
+adj.randindex.hc_LSI<-c()
+adj.randindex.LV_LSI<-c()
+for(i in 1:length(whm.cmd.lovein_Jacclone_LSI.list)){
+meta<-whm.cmd.lovein_Jacclone_LSI.list[[i]] %>% .[complete.cases(.),]
+randindex.hc_JacTree<-c(randindex.hc_JacTree,rand.index(as.numeric(as.character(meta$cluster)),as.numeric(as.character(meta$Clone_merge))))
+randindex.LV_JacTree<-c(randindex.LV_JacTree,rand.index(as.numeric(as.character(meta$lovein)),as.numeric(as.character(meta$Clone_merge))))
+randindex.hc_LSI<-c(randindex.hc_LSI,rand.index(as.numeric(as.character(meta$cluster)),as.numeric(as.character(meta$LSI_clones))))
+randindex.LV_LSI<-c(randindex.LV_LSI,rand.index(as.numeric(as.character(meta$lovein)),as.numeric(as.character(meta$LSI_clones))))
+adj.randindex.hc_JacTree<-cbind(adj.randindex.hc_JacTree,adjustedRand(as.numeric(as.character(meta$cluster)),as.numeric(as.character(meta$Clone_merge)))[2:4])
+adj.randindex.LV_JacTree<-cbind(adj.randindex.LV_JacTree,adjustedRand(as.numeric(as.character(meta$lovein)),as.numeric(as.character(meta$Clone_merge)))[2:4])
+adj.randindex.hc_LSI<-cbind(adj.randindex.hc_LSI,adjustedRand(as.numeric(as.character(meta$cluster)),as.numeric(as.character(meta$LSI_clones)))[2:4])
+adj.randindex.LV_LSI<-cbind(adj.randindex.LV_LSI,adjustedRand(as.numeric(as.character(meta$lovein)),as.numeric(as.character(meta$LSI_clones)))[2:4])
+
+}
+randindex<-list(randindex.hc_JacTree=randindex.hc_JacTree,randindex.LV_JacTree=randindex.LV_JacTree,randindex.hc_LSI=randindex.hc_LSI,randindex.LV_LSI=randindex.LV_LSI)
+adj.randindex<-list(adj.randindex.hc_JacTree=adj.randindex.hc_JacTree,adj.randindex.LV_JacTree=adj.randindex.LV_JacTree,adj.randindex.hc_LSI=adj.randindex.hc_LSI,adj.randindex.LV_LSI=adj.randindex.LV_LSI)
+
+return(list(randindex=randindex,adj.randindex=adj.randindex))
+}
+#### Lovin vs LSI
+get_rand_summary<-function(res,mitotracing_LSI.list,whm.list,phylo.list){
+mkp1.whm.cmd.lovein.list<-crispr_clustering(whm.list,hcN=5,res=res)
+whm.cmd.lovein_Jacclone.list<-make_whm.cmd.lovein_Jacc(mkp1.whm.cmd.lovein.list, phylo.list,min=10,pro=0.3, dump=0,whm.list)
+whm.cmd.lovein_Jacclone_LSI.list<-make_whm.cmd.lv.jac.lsi(mitotracing_LSI.list, whm.cmd.lovein_Jacclone.list,whm.list)
+rand<-compute_rand(whm.cmd.lovein_Jacclone_LSI.list)
+rand_2<-compute_rand_v2(whm.cmd.lovein_Jacclone_LSI.list)    
+#print(rand)
+result<-sapply(whm.cmd.lovein_Jacclone_LSI.list,function(x){
+c(x$lovein %>% unique %>% length , x$LSI_clones %>% unique %>% length )
+}) %>% t %>% cbind(., rand$randindex[[4]],rand$adj.randindex[[4]],t(rand_2$adj.randindex[[4]])) %>% as.data.frame()
+colnames(result)[1:4]<-c("N_CRSP","N_Mito","RI","ARI")
+    return(result)
+}
+
+make_whm.cmd.lovein_Jacc<-function(whm.cmd.lovein.list,phylo.list,min=5,pro=0.3, dump=0,whm.list){
+whm.cmd.lovein_Jacclone.list<-c()
+for(i in 1:length(whm.cmd.lovein.list)){
+    meta<-whm.cmd.lovein.list[[i]]
+    meta$Cell<-row.names(meta)
+    x<-Add_tree_cut_simple(phylo.list[[i]],MinCell=min,CellMeta=meta,prob.cut=pro,Dumpcut=dump)
+    whm.cmd.lovein_Jacclone.list<-c(whm.cmd.lovein_Jacclone.list,list(x))
+}
+names(whm.cmd.lovein_Jacclone.list)<-names(whm.list)
+return(whm.cmd.lovein_Jacclone.list)
+}
+
+#' This function is to make make_whm.cmd.lv.jac.lsi
+make_whm.cmd.lv.jac.lsi<-function(mitotracing_LSI.list,whm.cmd.lovein_Jacclone.list,whm.list){
+whm.cmd.lovein_Jacclone_LSI.list<-list()
+for(i in 1:length(mitotracing_LSI.list)){
+meta<-mitotracing_LSI.list[[i]]@Seurat@meta.data[,"seurat_clusters",drop=F] %>% rename(LSI_clones="seurat_clusters") %>% tibble::rownames_to_column("Cell")
+x<-merge(whm.cmd.lovein_Jacclone.list[[i]],meta) 
+whm.cmd.lovein_Jacclone_LSI.list<-c(whm.cmd.lovein_Jacclone_LSI.list,list(x))
+}
+names(whm.cmd.lovein_Jacclone_LSI.list)<-names(whm.list)
+    
+whm.cmd.lovein_Jacclone_LSI.list<-lapply(whm.cmd.lovein_Jacclone_LSI.list,function(x){
+    x$Clade_merge<-as.character(x$Clade_merge) %>% as.factor()
+    x$Clone_merge<-as.character(x$Clone_merge) %>% as.factor()
+    x$lovein<-as.character(x$lovein) %>% as.factor()
+    x$cluster<-as.character(x$cluster) %>% as.factor()
+    return(x)
+})
+return(whm.cmd.lovein_Jacclone_LSI.list)
+}
+
+## Function for plotting
+Draw_tree_Clone<-function(phy,meta,CloneCat="Clone_merge",title){
+n=length(unique(meta[,CloneCat]))
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector<-sample(col_vector,n,replace=T)
+p<-ggtree(as.treedata(phy), branch.length='none') 
+p<-p+geom_fruit( 
+         data=meta, 
+         mapping=aes_string(y="Cell",x=2,fill=CloneCat), geom=geom_tile,
+         pwidth=0.001, 
+         width=3, 
+         offset=0.05
+)+scale_fill_manual(values=col_vector)+ggtitle(title)
+    return(list(p,col_vector))
+}
